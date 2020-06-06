@@ -1,23 +1,25 @@
 defmodule MultiStream.Upload do
+  @enforce_keys [:adapter]
+
   @type t() :: %__MODULE__{
-          key: String.t(),
-          bucket: String.t(),
           filename: String.t(),
           content_type: String.t(),
           hash: reference() | String.t() | nil,
-          length: non_neg_integer(),
-          parts: list(),
-          parts_count: non_neg_integer(),
-          upload_id: String.t() | nil
+          size: non_neg_integer(),
+          enc_state: any(),
+          enc_key: String.t(),
+          adapter: any()
         }
 
-  defstruct key: "",
-            bucket: "",
-            filename: "",
+  defstruct filename: "",
             content_type: "",
             hash: nil,
-            length: 0,
-            parts: [],
-            parts_count: 0,
-            upload_id: nil
+            size: 0,
+            enc_state: nil,
+            enc_key: "",
+            adapter: nil
+
+  def new(adapter) do
+    %__MODULE__{adapter: adapter}
+  end
 end

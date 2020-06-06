@@ -15,10 +15,28 @@ defmodule MultiStream.Pages do
     |> layout()
   end
 
-  def upload_response() do
+  def upload_response(%{adapter: %MultiStream.Adapters.S3{}} = file) do
+    {:ok, presigned_url} =
+      ExAws.Config.new(:s3)
+      |> ExAws.S3.presigned_url(:get, "multi-upload-demo-25", file.adapter.key)
+
     """
     <div>
     Thanks for uploading!
+    <a target="_blank" href="#{presigned_url}">#{file.filename}</a>
+    </div>
+    """
+    |> layout()
+  end
+
+  def upload_response(file) do
+    # {:ok, presigned_url} =
+    #   ExAws.Config.new(:s3)
+    #   |> ExAws.S3.presigned_url(:get, "multi-upload-demo-25", file.adapter.key)
+    """
+    <div>
+    Thanks for uploading!
+    <a target="_blank" href="/download/?filename=#{file.filename}">#{file.filename}</a>
     </div>
     """
     |> layout()

@@ -1,19 +1,11 @@
 defmodule MultiStream do
   @moduledoc """
-  Parses multipart request body.
+  Parses multipart request body, file handling is configurable via adapters.
+
   ## Options
-  All options supported by `Plug.Conn.read_body/2` are also supported here.
-  They are repeated here for convenience:
-    * `:length` - sets the maximum number of bytes to read from the request,
-      defaults to 8_000_000 bytes. Unlike `Plug.Conn.read_body/2` supports
-      passing an MFA (`{module, function, args}`) which will be evaluated
-      on every request to determine the value.
-    * `:read_length` - sets the amount of bytes to read at one time from the
-      underlying socket to fill the chunk, defaults to 1_000_000 bytes
-    * `:read_timeout` - sets the timeout for each socket read, defaults to
-      15_000ms
-  So by default, `Plug.Parsers` will read 1_000_000 bytes at a time from the
-  socket with an overall limit of 8_000_000 bytes.
+    * `:adapter` - defines behaviour for multipart file handling
+    * `:adapter_opts` - options for the specified adapter, see the adapter for details
+
   Besides the options supported by `Plug.Conn.read_body/2`, the multipart parser
   also checks for:
     * `:headers` - containing the same `:length`, `:read_length`
@@ -29,18 +21,19 @@ defmodule MultiStream do
   """
 
   @behaviour Plug.Parsers
-
   require Logger
 
   def init(opts) do
     Logger.info("Initalized multi with opts #{inspect(opts)}")
+    adapter = Keyword.get(opts, :adapter) || raise "Must supply adapter in options"
+    default_adapter_opts = apply(adapter, :default_opts, [])
 
     # Remove the length from options as it would attempt
     # to eagerly read the body on the limit value.
-    {limit, opts} = Keyword.pop(opts, :length, 8_000_000_000)
+    {limit, opts} = Keyword.pop(opts, :length, default_adapter_opts[:length])
 
     # The read length is now our effective length per call.
-    {read_length, opts} = Keyword.pop(opts, :read_length, 5_242_880)
+    {read_length, opts} = Keyword.pop(opts, :read_length, default_adapter_opts[:read_length])
     opts = [length: read_length, read_length: read_length] ++ opts
 
     # The header options are handled individually.
@@ -119,12 +112,12 @@ defmodule MultiStream do
         {conn, limit, [{name, %{headers: headers, body: body}} | acc]}
 
       {:file, name, %MultiStream.Upload{} = uploaded} ->
-        uploaded = start_upload(uploaded, opts)
+        uploaded = apply(uploaded.adapter.__struct__, :start, [uploaded, opts[:adapter_opts]])
 
         {:ok, limit, conn, uploaded} =
           parse_multipart_file(Plug.Conn.read_part_body(conn, opts), limit, opts, uploaded)
 
-        uploaded = finish_upload(uploaded)
+        uploaded = apply(uploaded.adapter.__struct__, :close, [uploaded, opts[:adapter_opts]])
 
         {conn, limit, [{name, uploaded} | acc]}
 
@@ -152,27 +145,33 @@ defmodule MultiStream do
     {:ok, limit - byte_size(tail), body, conn}
   end
 
-  defp parse_multipart_file({:more, tail, conn}, limit, opts, uploaded)
-       when limit >= byte_size(tail) do
+  defp parse_multipart_file({:more, tail, conn}, limit, opts, uploaded) do
     chunk_size = byte_size(tail)
 
-    uploaded = set_upload_id(uploaded) |> upload_part(chunk_size, tail)
+    uploaded =
+      apply(uploaded.adapter.__struct__, :write_part, [
+        uploaded,
+        tail,
+        chunk_size,
+        opts[:adapter_opts]
+      ])
 
-    read_result = Plug.Conn.read_part_body(conn, opts)
-
-    parse_multipart_file(read_result, limit - chunk_size, opts, uploaded)
+    # keep reading.
+    Plug.Conn.read_part_body(conn, opts)
+    |> parse_multipart_file(limit - chunk_size, opts, uploaded)
   end
 
-  defp parse_multipart_file({:more, tail, conn}, limit, _opts, uploaded) do
-    {:ok, limit - byte_size(tail), conn, uploaded}
-  end
-
-  defp parse_multipart_file({:ok, tail, conn}, limit, _opts, uploaded)
-       when limit >= byte_size(tail) do
-    # when the chunk is <= 5MB just upload with single s3 upload.
+  defp parse_multipart_file({:ok, tail, conn}, limit, opts, uploaded)
+       when byte_size(tail) <= limit do
     chunk_size = byte_size(tail)
 
-    uploaded = upload_part(uploaded, chunk_size, tail)
+    uploaded =
+      apply(uploaded.adapter.__struct__, :write_part, [
+        uploaded,
+        tail,
+        chunk_size,
+        opts[:adapter_opts]
+      ])
 
     {:ok, limit - chunk_size, conn, uploaded}
   end
@@ -180,6 +179,8 @@ defmodule MultiStream do
   defp parse_multipart_file({:ok, tail, conn}, limit, _opts, uploaded) do
     {:ok, limit - byte_size(tail), conn, uploaded}
   end
+
+  # for a full chunk, when uploading file > 5 mb
 
   ## Helpers
 
@@ -239,109 +240,50 @@ defmodule MultiStream do
   end
 
   defp create_new_upload(filename, content_type, opts) do
-    %MultiStream.Upload{
-      filename: filename,
-      content_type: content_type,
-      key: gen_key(opts),
-      bucket: opts[:bucket]
-    }
+    # grab adapter from options, convert to struct, and create new upload struct
+    ms =
+      Keyword.get(opts, :adapter, MultiStream.Adapters.S3)
+      |> struct()
+      |> MultiStream.Upload.new()
+      |> Map.merge(%{
+        filename: filename,
+        content_type: content_type
+      })
+
+    apply(ms.adapter.__struct__, :init, [ms, opts[:adapter_opts]])
   end
 
-  defp get_header(headers, key) do
+  def get_header(headers, key) do
     case List.keyfind(headers, key, 0) do
       {^key, value} -> value
       nil -> nil
     end
   end
 
-  defp encode_hash(hash) do
-    :crypto.hash_final(hash)
-    |> Base.encode16()
-  end
+  # defp encode_hash(hash) do
+  #   :crypto.hash_final(hash)
+  #   |> Base.encode16()
+  # end
 
-  defp finish_upload(%{upload_id: nil} = uploaded) do
-    %{uploaded | hash: encode_hash(uploaded.hash)}
-  end
+  # defp start_enc(uploaded, opts) do
+  #   enc = Keyword.get(opts, :encryption, nil)
 
-  defp finish_upload(%{upload_id: upload_id} = uploaded) do
-    reversed_parts = Enum.map(uploaded.parts, &Task.await/1) |> Enum.reverse()
+  #   if enc != nil do
+  #     {cipher, key} = enc
+  #     iv = :crypto.strong_rand_bytes(16)
+  #     state = :crypto.crypto_init(cipher, key, iv, true)
+  #     %{uploaded | enc_state: state, enc_key: Base.encode16(iv <> key)}
+  #   else
+  #     uploaded
+  #   end
+  # end
 
-    ExAws.S3.complete_multipart_upload(
-      uploaded.bucket,
-      uploaded.key,
-      upload_id,
-      reversed_parts
-    )
-    |> ExAws.request!()
+  # defp encrypt_chunk(%{enc_state: nil}, data) do
+  #   data
+  # end
 
-    %{uploaded | hash: encode_hash(uploaded.hash), parts: reversed_parts}
-  end
-
-  defp start_upload(uploaded, opts) do
-    %{uploaded | hash: :crypto.hash_init(opts[:hash_algo])}
-  end
-
-  # used to start a new multipart upload, or just return existing upload_id
-  defp set_upload_id(%{upload_id: nil} = uploaded) do
-    %{body: %{upload_id: upload_id}} =
-      ExAws.S3.initiate_multipart_upload(uploaded.bucket, uploaded.key) |> ExAws.request!()
-
-    %{uploaded | upload_id: upload_id}
-  end
-
-  defp set_upload_id(uploaded), do: uploaded
-
-  defp gen_key(opts) do
-    prefix = Keyword.get(opts, :upload_prefix, "upload")
-    key_generator = Keyword.get(opts, :key_generator, &default_key_generator/0)
-
-    Path.join([prefix, key_generator.()])
-  end
-
-  defp default_key_generator() do
-    :crypto.strong_rand_bytes(64) |> Base.url_encode64() |> binary_part(0, 32)
-  end
-
-  # if upload_id is nil and parts_count: 0 the file is under 5 mb so just upload it in one request.
-  defp upload_part(%MultiStream.Upload{upload_id: nil, parts_count: 0} = uploaded, size, body) do
-    ExAws.S3.put_object(uploaded.bucket, uploaded.key, body)
-    |> ExAws.request!()
-
-    %{
-      uploaded
-      | length: size + uploaded.length,
-        hash: :crypto.hash_update(uploaded.hash, body)
-    }
-  end
-
-  defp upload_part(%MultiStream.Upload{} = uploaded, size, body) do
-    parts_count = uploaded.parts_count + 1
-
-    new_part_async = upload_async(uploaded, parts_count, body)
-
-    %{
-      uploaded
-      | length: size + uploaded.length,
-        hash: :crypto.hash_update(uploaded.hash, body),
-        parts_count: parts_count,
-        parts: [new_part_async | uploaded.parts]
-    }
-  end
-
-  # launches async task to upload this part.
-  defp upload_async(uploaded, parts_count, body) do
-    Task.async(fn ->
-      %{headers: headers} =
-        ExAws.S3.upload_part(
-          uploaded.bucket,
-          uploaded.key,
-          uploaded.upload_id,
-          parts_count,
-          body
-        )
-        |> ExAws.request!()
-
-      {parts_count, get_header(headers, "ETag")}
-    end)
-  end
+  # defp encrypt_chunk(%{enc_state: enc_state} = uploaded, data) do
+  #   Logger.info("encrypting chunk #{uploaded.parts_count}")
+  #   :crypto.crypto_update(enc_state, data)
+  # end
 end
